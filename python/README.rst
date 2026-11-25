@@ -45,3 +45,29 @@ The required initialization parameters are:
 * **n_components:** Dictionary or integer; if integer use the same number of components in each marginalization, otherwise every (key,value) pair refers to the number of components (value) in a marginalization (key).
 
 More detailed documentation, and additional options, can be found in **dpca.py**.
+
+Parity with the MATLAB implementation
+-------------------------------------
+
+All numerics are delegated to ``dPCA.core``, a 1:1 port of the MATLAB code (``dpca``,
+``dpca_marginalize``, ``dpca_explainedVariance``, ``dpca_getNoiseCovariance``,
+``dpca_optimizeLambda``, ``dpca_classificationAccuracy``, ``dpca_classificationShuffled``,
+``dpca_signifComponents``). ``dPCA.core`` keeps the MATLAB conventions (single trials as the
+*last* axis, 1-based parameter numbers and class ids) so MATLAB scripts can be ported directly.
+The test suite in ``tests/`` checks parity against a literal transliteration of the MATLAB files.
+
+As in MATLAB, the last parameter axis is assumed to be time. The workflow of ``dpca_demo.m``
+with the class API:
+
+.. code-block:: python
+
+   # X: (neurons, stimuli, time); trialX: (trials, neurons, stimuli, time), NaN-padded at the end
+   model = dPCA.dPCA(labels='st', n_components=10, regularizer='auto', random_state=0)
+   model.fit(X, trialX)                              # lambda chosen by cross-validation
+   Cnoise = model.get_noise_covariance(X, trialX)
+   Z = model.fit_transform(X, Cnoise=Cnoise)         # final fit with noise covariance
+   masks = model.significance_analysis(X, trialX, n_shuffles=100, n_splits=100, n_consecutive=10)
+
+``n_components`` is the number of components *per marginalization*; components are ordered by
+explained variance and signed as in MATLAB. ``explained_variance_ratio_`` is MATLAB's
+``margVar`` and ``explained_var_`` holds all measures of ``dpca_explainedVariance``.

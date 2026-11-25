@@ -19,7 +19,7 @@ Simple example code for surrogate data can be found in [**dpca_demo.ipynb**](htt
 
 ### Python package
 
-The Python package is tested against Python 2.7 and Python 3.4. To install, first make sure that numpy, cython, scipy, sklearn, itertools and numexpr are avaible. Then copy the files from the Python subfolder to a location in the Python search path.
+The Python package requires numpy, scipy and scikit-learn (`pip install dpca`). Its numerics are a 1:1 port of the MATLAB code and are tested for parity against it (`python -m pytest tests` in the `python` folder).
 
 Alternatively, from the terminal you can install the package by running:
 

@@ -3,3 +3,5 @@ python/build
 python/.ipynb_checkpoints
 python/dPCA/nan_shuffle.c
 matlab/tmp_*
+python/dPCA.egg-info/
+__pycache__/

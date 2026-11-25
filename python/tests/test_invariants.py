@@ -167,3 +167,24 @@ def test_decoding_sanity():
     shuf, _ = core.dpca_classification_shuffled(Xtrial, ntr, num_shuffles=10, num_rep=5, lambda_=1e-4,
                                                 rng=np.random.default_rng(1))
     assert np.nanmean(shuf[0]) < 0.45          # chance = 0.25
+
+
+# ---------------------------------------------------------------- parallel execution
+@pytest.mark.parametrize("sim", [False, True])
+def test_n_jobs_gives_identical_results(data3, data3_sim, sim):
+    """All random numbers are drawn up front in the serial order, so parallel runs must give
+    exactly the same results as serial ones."""
+    d = data3_sim if sim else data3
+    combined = [[1, [1, 3]], [2, [2, 3]], [3], [[1, 2], [1, 2, 3]]]
+    args = (d["Xfull"], d["Xtrial"], d["numOfTrials"])
+    kw = dict(combined_params=combined, simultaneous=sim)
+    for n_jobs in (1, 2):
+        lam = quiet(core.dpca_optimize_lambda, *args, num_rep=3, rng=1, n_jobs=n_jobs, **kw)
+        acc = core.dpca_classification_accuracy(*args, num_rep=3, lambda_=1e-5, rng=2, n_jobs=n_jobs, **kw)
+        shuf = core.dpca_classification_shuffled(d["Xtrial"], d["numOfTrials"], num_shuffles=3, num_rep=2,
+                                                 lambda_=1e-5, rng=3, n_jobs=n_jobs, **kw)
+        if n_jobs == 1:
+            ref = (lam, acc, shuf)
+        else:
+            for a, b in zip(lam + acc + shuf, ref[0] + ref[1] + ref[2]):
+                np.testing.assert_array_equal(a, b)

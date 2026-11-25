@@ -72,6 +72,11 @@ class dPCA(BaseEstimator):
     simultaneous : bool (default False)
         Whether the neurons were recorded simultaneously (same trials for all neurons).
 
+    n_jobs : int (default 1)
+        Number of parallel processes for the cross-validation repetitions of regularizer='auto'
+        and for the shuffles of ``significance_analysis`` (-1 = all cores). The results do not
+        depend on it.
+
     copy, n_iter :
         Unused; kept for backwards compatibility.
 
@@ -106,7 +111,7 @@ class dPCA(BaseEstimator):
 
     def __init__(self, labels=None, join=None, n_components=10, regularizer=None, copy=True, n_iter=None,
                  random_state=None, n_trials=10, lambdas=None, cv_method="training", noise_cov_type="pooled",
-                 simultaneous=False):
+                 simultaneous=False, n_jobs=1):
         if isinstance(labels, str):
             self.labels = labels
         elif isinstance(labels, int):
@@ -131,6 +136,7 @@ class dPCA(BaseEstimator):
         self.cv_method = cv_method
         self.noise_cov_type = noise_cov_type
         self.simultaneous = simultaneous
+        self.n_jobs = n_jobs
         self.marginalizations = self._get_parameter_combinations()
         self.debug = 2
 
@@ -242,16 +248,15 @@ class dPCA(BaseEstimator):
         self.explained_variance_ratio_ = {}
         for k in keys:
             Xm, P, D = margs[k], self.P[k], self.D[k]
-            self.explained_variance_ratio_[k] = [
-                (np.sum(Xm ** 2) - np.sum((Xm - np.outer(P[:, j], D[:, j] @ Xm)) ** 2)) / total
-                for j in range(D.shape[1])]
+            # (||Xm||^2 - ||Xm - P_j D_j' Xm||^2) / total, per component j
+            self.explained_variance_ratio_[k] = list(core._component_var(Xm, D, P) / total)
 
     def _optimize_regularization(self, X, trialX):
         Xtrial, num_trials = self._matlab_trials(X, trialX)
         lam, lams, errors, errors_marg = core.dpca_optimize_lambda(
             X, Xtrial, num_trials, num_comps=self._num_comps(), lambdas=self.lambdas, num_rep=self.n_trials,
             combined_params=self._combined_params(), method=self.cv_method, simultaneous=self.simultaneous,
-            noise_cov_type=self.noise_cov_type, rng=self._rng(), verbose=self.debug > 1)
+            noise_cov_type=self.noise_cov_type, rng=self._rng(), verbose=self.debug > 1, n_jobs=self.n_jobs)
         lambdas = 1e-7 * 1.5 ** np.arange(26) if self.lambdas is None else np.asarray(self.lambdas)
         if self.debug > 0 and lam in (lambdas[0], lambdas[-1]):
             print("Warning: Optimal regularization parameter lies at the boundary of the search interval. "
@@ -378,7 +383,7 @@ class dPCA(BaseEstimator):
         rng = self._rng()
         common = dict(lambda_=self.regularizer, num_rep=n_splits, combined_params=groups, decoding_classes=classes,
                       simultaneous=self.simultaneous, noise_cov_type=self.noise_cov_type, rng=rng,
-                      verbose=self.debug > 1)
+                      verbose=self.debug > 1, n_jobs=self.n_jobs)
         acc, _ = core.dpca_classification_accuracy(X, Xtrial, num_trials, num_comps=n_components, **common)
         shuf, _ = core.dpca_classification_shuffled(Xtrial, num_trials, num_shuffles=n_shuffles, **common)
 

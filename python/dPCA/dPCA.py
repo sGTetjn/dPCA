@@ -1,22 +1,22 @@
 """ demixed Principal Component Analysis
+
+sklearn-style interface. All numerics are delegated to :mod:`dPCA.core`, a 1:1 port of the
+reference MATLAB implementation, so results match MATLAB exactly.
 """
 
 # Author: Wieland Brendel <wieland.brendel@neuro.fchampalimaud.org>
 #
 # License: BSD 3 clause
 
-from __future__ import print_function
-
-import numpy as np
+import warnings
 from collections import OrderedDict
 from itertools import combinations, chain
-from scipy.sparse.linalg import svds
-from scipy.linalg import pinv
 
+import numpy as np
 from sklearn.base import BaseEstimator
-from sklearn.utils.extmath import randomized_svd
-import numexpr as ne
-from .utils import shuffle2D, classification, denoise_mask
+
+from . import core
+
 
 class dPCA(BaseEstimator):
     """ demixed Principal component analysis (dPCA)
@@ -30,955 +30,368 @@ class dPCA(BaseEstimator):
     Parameters
     ----------
     labels : int or string
-        Labels of feature axis.
-
-        If int the corresponding number of labels are selected from the alphabet 'abcde...'
+        Labels of the parameter axes (one character per axis), e.g. 'st' for stimulus and
+        time. If int, the corresponding number of labels is taken from 'abcde...'.
+        As in the MATLAB implementation, the **last axis is assumed to be time**.
 
     join : None or dict
-        Parameter combinations to join
+        Marginalizations to join (MATLAB 'combinedParams'), e.g. {'s': ['s', 'st']}. The
+        letters of every key and combination must follow the order of ``labels``.
 
-        If a data set has parametrized by time t and stimulus s, then dPCA will split
-        the data into marginalizations corresponding to 't', 's' and 'ts'. At times,
-        we want to join different marginalizations (like 's' and 'ts'), e.g. if
-        we are only interested in the time-modulated stimulus components. In this case,
-        we would pass {'ts' : ['s','ts']}.
+    n_components : int or dict
+        Number of components per marginalization (an int applies to every marginalization,
+        a dict sets them individually, e.g. {'t': 10, 'st': 5}). Within each marginalization
+        components are ordered by explained variance and signed so that encoders have mostly
+        positive entries (as in MATLAB). Defaults to 10.
 
-    regularizer : None, float, 'auto'
-        Regularization parameter. If None or 0, then no regularization is applied.
-        For float, the regularization weight is regularizer*var(data). If 'auto', the
-        optimal regularization parameter is found during fitting (might take some time).
+    regularizer : None, float or 'auto'
+        Ridge parameter lambda (MATLAB 'lambda'); the penalty is (lambda * total variance)^2.
+        If 'auto', lambda is chosen by cross-validation during ``fit`` (MATLAB
+        ``dpca_optimizeLambda``), which requires trial-by-trial data. As in MATLAB, the noise
+        covariance is used inside the cross-validation, but the final fit only uses it if
+        passed explicitly: to reproduce ``dpca_demo.m`` call
+        ``fit(X, trialX, Cnoise=model.get_noise_covariance(X, trialX))``.
+        Note: MATLAB's scalar ``numComps`` mode (keep the top k components overall) is
+        available through :func:`dPCA.core.dpca`, not through this class.
 
-    n_components : None, int or dict
-        Number of components to keep.
+    random_state : None, int or numpy.random.Generator
+        Seed for cross-validation splits and label shuffles.
 
-        If n_components is int, then the same number of components are kept in every
-        marginalization. Otherwise, the dict allows to set the number of components
-        in each marginalization (e.g. {'t' : 10, 'ts' : 5}). Defaults to 10.
+    n_trials : int (default 10)
+        Number of cross-validation repetitions used when regularizer='auto' (MATLAB 'numRep').
 
-    copy : bool
-        If False, data passed to fit are overwritten and running
-        fit(X).transform(X) will not yield the expected results,
-        use fit_transform(X) instead.
+    lambdas : array or None
+        Grid of lambdas searched when regularizer='auto' (default 1e-7 * 1.5**[0..25]).
 
-    n_iter : int (default: 0)
-        Number of iterations for randomized SVD solver (sklearn).
+    cv_method : 'training' (default), 'neuronwise' or 'naive'
+        Cross-validation objective for regularizer='auto' (MATLAB 'method').
+
+    noise_cov_type : 'pooled' (default), 'averaged' or 'none'
+        Noise covariance used inside cross-validation and significance analysis.
+
+    simultaneous : bool (default False)
+        Whether the neurons were recorded simultaneously (same trials for all neurons).
+
+    copy, n_iter :
+        Unused; kept for backwards compatibility.
 
     Attributes
     ----------
-    explained_variance_ratio_ : dict with arrays, [n_components]
-        Dictionary in which each key refers to one marginalization and the \
-        value is a vector with the percentage of variance explained by each of \
-        the marginal components.
+    P, D : dict
+        Encoder and decoder matrices (n_features, n_components) per marginalization.
+    explained_variance_ratio_ : dict
+        Fraction of total variance explained by each component within its own
+        marginalization (MATLAB ``explVar.margVar``), computed on the training data.
+    explained_var_ : dict
+        All explained-variance measures of MATLAB ``dpca_explainedVariance`` (percentages)
+        for the components concatenated in ``component_order_``.
 
     Notes
     -----
     Implements the dPCA model from:
-    D Kobak*, W Brendel*, C Constantinidis, C Feierstein, A Kepecs, Z Mainen, \
-    R Romo, X-L Qi, N Uchida, C Machens
-    Demixed principal component analysis of population activity in higher \
-    cortical areas reveals independent representation of task parameters,
-
+    D Kobak*, W Brendel*, C Constantinidis, C Feierstein, A Kepecs, Z Mainen,
+    R Romo, X-L Qi, N Uchida, C Machens. Demixed principal component analysis of
+    neural population data. eLife 2016;5:e10989.
 
     Examples
     --------
-
     >>> import numpy as np
     >>> from dPCA import dPCA
-    >>> X = np.array([[-1, -1], [-2, -1], [-3, -2], [1, 1], [2, 1], [3, 2]])
-    >>> dpca = dPCA(n_components=2)
-    >>> dpca.fit(X)
-    PCA(copy=True, n_components=2, whiten=False)
-    >>> print(pca.explained_variance_ratio_)
-    [ 0.99244...  0.00755...]
+    >>> X = np.random.randn(20, 4, 50)        # neurons x stimuli x time
+    >>> model = dPCA.dPCA(labels='st', n_components=3)
+    >>> Z = model.fit_transform(X)
+    >>> Z['st'].shape
+    (3, 4, 50)
     """
-    def __init__(self, labels=None, join=None, n_components=10, regularizer=None, copy=True, n_iter=0):
-        # create labels from alphabet if not provided
-        if isinstance(labels,str):
+
+    def __init__(self, labels=None, join=None, n_components=10, regularizer=None, copy=True, n_iter=None,
+                 random_state=None, n_trials=10, lambdas=None, cv_method="training", noise_cov_type="pooled",
+                 simultaneous=False):
+        if isinstance(labels, str):
             self.labels = labels
-        elif isinstance(labels,int):
-            alphabet = 'abcdefghijklmnopqrstuvwxyz'
-            self.labels = alphabet[:labels]
+        elif isinstance(labels, int):
+            self.labels = "abcdefghijklmnopqrstuvwxyz"[:labels]
         else:
-            raise TypeError('Wrong type for labels. Please either set labels to the number of variables or provide the axis labels as a single string of characters (like "ts" for time and stimulus)')
+            raise TypeError('Wrong type for labels. Please either set labels to the number of variables or provide '
+                            'the axis labels as a single string of characters (like "ts" for time and stimulus)')
+        if n_iter is not None:
+            warnings.warn("n_iter is ignored: decompositions are computed exactly (as in MATLAB).",
+                          DeprecationWarning, stacklevel=2)
 
         self._join = join
         self.join = join
-        self.regularizer = 0 if regularizer == None else regularizer
-        self.opt_regularizer_flag = regularizer == 'auto'
+        self.regularizer = 0 if regularizer is None else regularizer
+        self.opt_regularizer_flag = isinstance(regularizer, str) and regularizer == "auto"
         self.n_components = n_components
         self.copy = copy
-        self.marginalizations = self._get_parameter_combinations()
         self.n_iter = n_iter
-
-        # set debug mode, 0 = no reports, 1 = warnings, 2 = warnings & progress, >2 = everything
+        self.random_state = random_state
+        self.n_trials = n_trials
+        self.lambdas = lambdas
+        self.cv_method = cv_method
+        self.noise_cov_type = noise_cov_type
+        self.simultaneous = simultaneous
+        self.marginalizations = self._get_parameter_combinations()
         self.debug = 2
 
-        if regularizer == 'auto':
-            print("""You chose to determine the regularization parameter automatically. This can
-                    take substantial time and grows linearly with the number of crossvalidation
-                    folds. The latter can be set by changing self.n_trials (default = 3). Similarly,
-                    use self.protect to set the list of axes that are not supposed to get to get shuffled
-                    (e.g. upon splitting the data into test- and training, time-points should always
-                    be drawn from the same trial, i.e. self.protect = ['t']). This can significantly
-                    speed up the code.""")
+    # ------------------------------------------------------------------ bookkeeping
+    def _get_parameter_combinations(self, join=True):
+        ''' Returns all parameter combinations, e.g. for labels = 'xyz'
 
-            self.n_trials = 3
-            self.protect = None
+            {'x' : {0}, 'y' : {1}, 'z' : {2}, 'xy' : {0,1}, 'xz' : {0,2}, 'yz' : {1,2}, 'xyz' : {0,1,2}}
 
-    def fit(self, X, trialX=None):
+            If join == True, parameter combinations are condensed according to self._join (the value
+            of a joined key is the list of the joined sets).
+        '''
+        D = len(self.labels)
+        subsets = list(chain.from_iterable(combinations(range(D), r) for r in range(1, D + 1)))
+        pcombs = OrderedDict((''.join(self.labels[i] for i in s), set(s)) for s in subsets)
+        if isinstance(self._join, dict) and join:
+            for key, combs in self._join.items():
+                tmp = [pcombs[comb] for comb in combs]
+                for comb in combs:
+                    del pcombs[comb]
+                pcombs[key] = tmp
+        return pcombs
+
+    def _combined_params(self):
+        """MATLAB combinedParams (1-based parameters) following the order of self.marginalizations."""
+        groups = []
+        for val in self.marginalizations.values():
+            sets = val if isinstance(val, list) else [val]
+            groups.append([sorted(i + 1 for i in s) for s in sets])
+        return groups
+
+    def _num_comps(self, n_components=None):
+        n_components = self.n_components if n_components is None else n_components
+        if isinstance(n_components, dict):
+            return [int(n_components[k]) for k in self.marginalizations]
+        return [int(n_components)] * len(self.marginalizations)
+
+    def _rng(self):
+        return self.random_state if isinstance(self.random_state, np.random.Generator) \
+            else np.random.default_rng(self.random_state)
+
+    def _matlab_trials(self, X, trialX):
+        """(n_trials, N, ...) -> MATLAB layout (N, ..., n_trials) plus numOfTrials (N, conditions)."""
+        trialX = np.asarray(trialX, dtype=float)
+        if trialX.shape[1:] != X.shape:
+            raise ValueError("trialX must have shape (n_trials,) + X.shape")
+        Xtrial = np.moveaxis(trialX, 0, -1)
+        valid = ~np.isnan(Xtrial[..., 0, :])                   # (N, conditions, trials) at first time bin
+        num_trials = valid.sum(-1)
+        if np.any(valid != (np.arange(valid.shape[-1]) < num_trials[..., None])):
+            raise ValueError("Missing trials must be NaN and placed at the end of the trial axis.")
+        return Xtrial, num_trials
+
+    # ------------------------------------------------------------------ fitting
+    def fit(self, X, trialX=None, Cnoise=None):
         """Fit the model with X.
 
         Parameters
         ----------
-        X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-            Training data, where n_samples in the number of samples
-            and n_features_j is the number of the j-features (where the axis correspond
-            to different parameters).
+        X : array-like, shape (n_features, n_1, n_2, ...)
+            Trial-averaged data (neurons first; the last parameter axis is time).
+        trialX : array-like, shape (n_trials, n_features, n_1, n_2, ...), optional
+            Single-trial data, NaN-padded at the end of the trial axis. Required for
+            regularizer='auto'.
+        Cnoise : array (n_features, n_features), optional
+            Noise covariance (see ``get_noise_covariance``), MATLAB dpca(..., 'Cnoise', Cnoise).
 
         Returns
         -------
-        self : object
-            Returns the instance itself.
+        self
         """
-        self._fit(X,trialX=trialX)
+        self._fit(X, trialX=trialX, Cnoise=Cnoise)
         return self
 
-    def fit_transform(self, X, trialX=None):
-        """Fit the model with X and apply the dimensionality reduction on X.
-
-        Parameters
-        ----------
-        X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-            Training data, where n_samples in the number of samples
-            and n_features_j is the number of the j-features (where the axis correspond
-            to different parameters).
-
-        Returns
-        -------
-        X_new : dict with arrays with the same shape as X
-            Dictionary in which each key refers to one marginalization and the value is the
-            latent component.
-
-        """
-        self._fit(X,trialX=trialX)
-
+    def fit_transform(self, X, trialX=None, Cnoise=None):
+        """Fit the model with X and return ``transform(X)``."""
+        self._fit(X, trialX=trialX, Cnoise=Cnoise)
         return self.transform(X)
 
-    def _get_parameter_combinations(self,join=True):
-        ''' Returns all parameter combinations, e.g. for labels = 'xyz'
-
-            {'x' : (0,), 'y' : (1,), 'z' : (2,), 'xy' : (0,1), 'xz' : (0,2), 'yz' : (1,2), 'xyz' : (0,1,2)}
-
-            If join == True, parameter combinations are condensed according to self._join, Otherwise all
-            combinations are returned.
-        '''
-        # subsets = () (0,) (1,) (2,) (0,1) (0,2) (1,2) (0,1,2)"
-        subsets = list(chain.from_iterable(combinations(list(range(len(self.labels))), r) for r in range(len(self.labels))))
-
-        # delete empty set & add (0,1,2)
-        del subsets[0]
-        subsets.append(list(range(len(self.labels))))
-
-        # create dictionary
-        pcombs = OrderedDict()
-        for subset in subsets:
-            key = ''.join([self.labels[i] for i in subset])
-            pcombs[key] = set(subset)
-
-        # condense dict if not None
-        if isinstance(self._join,dict) and join:
-            for key, combs in self._join.items():
-                tmp = [pcombs[comb] for comb in combs]
-
-                for comb in combs:
-                    del pcombs[comb]
-
-                pcombs[key] = tmp
-
-        return pcombs
-
-    def _marginalize(self,X,save_memory=False):
-        """ Marginalize the data matrix
-
-        Parameters
-        ----------
-        X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-            Training data, where n_samples in the number of samples
-            and n_features_j is the number of the j-features (where the axis correspond
-            to different parameters).
-
-        save_memory : bool, set to True if memory really is an issue (though optimization is not perfect yet)
-
-        Returns
-        -------
-        mXs : dictionary, with values corresponding to the marginalized data (and the key refers to the marginalization)
-        """
-
-        def mmean(X,axes,expand=False):
-            ''' Takes mean along several axis (given as list). If expand the averaged dimensions will be filled with
-                new axis to retain the dimension.
-            '''
-            Z = X.copy()
-
-            for ax in np.sort(axes)[::-1]:
-                Z = np.mean(Z,ax)
-
-                if expand == True:
-                    Z = np.expand_dims(Z,ax)
-
-            return Z
-
-        def dense_marg(Y,mYs):
-            ''' The original marginalizations as returned by "get_marginalizations" are sparse in the sense that
-                marginalized axis are newaxis. This functions blows them up to the original size of the data set
-                (need for optimization).
-            '''
-            tmp = np.zeros_like(Y)
-            for key in list(mYs.keys()):
-
-                mYs[key] = (tmp + mYs[key]).reshape((Y.shape[0],-1))
-
-            return mYs
-
-        Xres = X.copy()      # residual of data
-
-        # center data
-        Xres -= np.mean(Xres.reshape((Xres.shape[0],-1)),-1).reshape((Xres.shape[0],) + (len(Xres.shape)-1)*(1,))
-
-        # init dict with marginals
-        Xmargs = OrderedDict()
-
-        # get parameter combinations
-        pcombs = self._get_parameter_combinations(join=False)
-
-        # subtract the mean
-        S = list(pcombs.values())[-1]    # full set of indices
-
-        if save_memory:
-            for key, phi in pcombs.items():
-                S_without_phi = list(S - phi)
-
-                # compute marginalization and save
-                Xmargs[key] = mmean(Xres,np.array(S_without_phi)+1,expand=True)
-
-                # subtract the marginalization from the data
-                Xres -= Xmargs[key]
-        else:
-            # efficient precomputation of means
-            pre_mean = {}
-
-            for key, phi in pcombs.items():
-                if len(key) == 1:
-                    pre_mean[key] = mmean(Xres,np.array(list(phi))+1,expand=True)
-                else:
-                    pre_mean[key] = mmean(pre_mean[key[:-1]],np.array([list(phi)[-1]])+1,expand=True)
-
-            # compute marginalizations
-            for key, phi in pcombs.items():
-                key_without_phi = ''.join(filter(lambda ch: ch not in key, self.labels))
-                # self.labels.translate(None, key)
-
-                # build local dictionary for numexpr
-                X = pre_mean[key_without_phi] if len(key_without_phi) > 0 else Xres
-
-                if len(key) > 1:
-                    subsets = list(chain.from_iterable(combinations(key, r) for r in range(1,len(key))))
-                    subsets = [''.join(subset) for subset in subsets]
-                    local_dict = {subset : Xmargs[subset] for subset in subsets}
-                    local_dict['X'] = X
-
-                    Xmargs[key] = ne.evaluate('X - ' + ' - '.join(subsets),local_dict=local_dict)
-                else:
-                    Xmargs[key] = X
-
-        # condense dict if not None
-        if isinstance(self._join,dict):
-            for key, combs in self._join.items():
-                Xshape = np.ones(len(self.labels)+1,dtype='int')
-                for comb in combs:
-                    sh = np.array(Xmargs[comb].shape)
-                    Xshape[(sh-1).nonzero()] = sh[(sh-1).nonzero()]
-
-                tmp = np.zeros(Xshape)
-
-                for comb in combs:
-                    tmp += Xmargs[comb]
-                    del Xmargs[comb]
-
-                Xmargs[key] = tmp
-
-        Xmargs = dense_marg(X,Xmargs)
-
-        return Xmargs
-
-    def _optimize_regularization(self,X,trialX,center=True,lams='auto'):
-        """ Optimization routine to find optimal regularization parameter.
-
-            TO DO: Routine is pretty dumb right now (go through predetermined
-            list and find minimum). There  are several ways to speed it up.
-        """
-
-        # center data
-        if center:
-            X = X - np.mean(X.reshape((X.shape[0],-1)),1).reshape((X.shape[0],)\
-                  + len(self.labels)*(1,))
-
-        # compute variance of data
-        varX = np.sum(X**2)
-
-        # test different inits and regularization parameters
-        if lams == 'auto':
-            N = 45
-            lams = np.logspace(0,N,num=N, base=1.4, endpoint=False)*1e-7
-
-        # compute crossvalidated score over n_trials repetitions
-        scores = self.crossval_score(lams,X,trialX,mean=False)
-
-        # take mean over total scores
-        totalscore = np.mean(np.sum(np.dstack([scores[key] for key in list(scores.keys())]),-1),0)
-
-        # Raise warning if optimal lambda lies at boundaries
-        if np.argmin(totalscore) == 0 or np.argmin(totalscore) == len(totalscore) - 1:
-            if self.debug > 0:
-                print("Warning: Optimal regularization parameter lies at the \
-                       boundary of the search interval. Please provide \
-                       different search list (key: lams).")
-
-        # set minimum as new lambda
-        self.regularizer = lams[np.argmin(totalscore)]
-
-        if self.debug > 1:
-            print('Optimized regularization, optimal lambda = ', self.regularizer)
-            print('Regularization will be fixed; to compute the optimal \
-                   parameter again on the next fit, please \
-                   set opt_regularizer_flag to True.')
-
-            self.opt_regularizer_flag = False
-
-    def crossval_score(self,lams,X,trialX,mean=True):
-        """ Calculates crossvalidation scores for a given set of regularization
-            parameters. To this end it takes one parameter off the list,
-            computes the model on a training set and then validates the
-            reconstruction performance on a validation set.
-
-            Parameters
-            ----------
-            lams: 1D array of floats
-                Array of regularization parameters to test.
-
-            X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-                Training data, where n_samples in the number of samples
-                and n_features_j is the number of the j-features (where the
-                axis correspond to different parameters).
-
-            trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                with different trials. If different combinations of features have different number
-                of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                points with NaN.
-
-            mean: bool (default: True)
-                Set True if the crossvalidation score should be averaged over
-                all marginalizations, otherwise False.
-
-            Returns
-            -------
-            mXs : dictionary, with values corresponding to the marginalized
-                  data (and the key refers to the marginalization)
-        """
-        # placeholder for scores
-        scores = np.zeros((self.n_trials,len(lams))) if mean else {key : np.zeros((self.n_trials,len(lams))) for key in list(self.marginalizations.keys())}
-
-        # compute number of samples in each condition
-        N_samples = self._get_n_samples(trialX,protect=self.protect)
-
-        for trial in range(self.n_trials):
-            print("Starting trial ", trial + 1, "/", self.n_trials)
-
-            # perform split into training and test trials
-            trainX, validX = self.train_test_split(X,trialX,N_samples=N_samples)
-
-            # compute marginalization of test and validation data
-            trainmXs, validmXs = self._marginalize(trainX), self._marginalize(validX)
-
-            # compute crossvalidation score for every regularization parameter
-            for k, lam in enumerate(lams):
-                # fit dpca model
-                self.regularizer = lam
-                self._fit(trainX,mXs=trainmXs,optimize=False)
-
-                # compute crossvalidation score
-                if mean:
-                    scores[trial,k] = self._score(validX,validmXs)
-                else:
-                    tmp = self._score(validX,validmXs,mean=False)
-                    for key in list(self.marginalizations.keys()):
-                        scores[key][trial,k] = tmp[key]
-
-        return scores
-
-    def _score(self,X,mXs,mean=True):
-        """ Scoring for crossvalidation. Predicts one observable (e.g. one neuron) of X at a time, using all other dimensions:
-
-            \sum_phi ||X[n] - F_\phi D_phi^{-n} X^{-n}||^2
-
-            where phi refers to the marginalization and X^{-n} (D_phi^{-n}) are all rows of X (D) except the n-th row.
-        """
-        n_features = X.shape[0]
-        X = X.reshape((n_features,-1))
-
-        error = {key: 0 for key in list(mXs.keys())}
-        PDY  = {key : np.dot(self.P[key],np.dot(self.D[key].T,X)) for key in list(mXs.keys())}
-        trPD = {key : np.sum(self.P[key]*self.D[key],1) for key in list(mXs.keys())}
-
-        for key in list(mXs.keys()):
-            error[key] = np.sum((mXs[key] - PDY[key] + trPD[key][:,None]*X)**2)
-
-        return error if not mean else np.sum(list(error.values()))
-
-    def _randomized_dpca(self,X,mXs,pinvX=None):
-        """ Solves the dPCA minimization problem analytically by using a randomized SVD solver from sklearn.
-
-            Returns
-            -------
-            P : dict mapping strings to array-like,
-                Holds encoding matrices for each term in variance decompostions (used in inverse_transform
-                to map from low-dimensional representation back to original data space).
-
-            D : dict mapping strings to array-like,
-                Holds decoding matrices for each term in variance decompostions (used to transform data
-                to low-dimensional space).
-
-        """
-
-        n_features = X.shape[0]
-        rX = X.reshape((n_features,-1))
-        pinvX = pinv(rX) if pinvX is None else pinvX
-
-        P, D = {}, {}
-
-        for key in list(mXs.keys()):
-            mX = mXs[key].reshape((n_features,-1)) # called X_phi in paper
-            C = np.dot(mX,pinvX)
-
-            if isinstance(self.n_components,dict):
-                U,s,V = randomized_svd(np.dot(C,rX),n_components=self.n_components[key],n_iter=self.n_iter,random_state=np.random.randint(10e5))
-            else:
-                U,s,V = randomized_svd(np.dot(C,rX),n_components=self.n_components,n_iter=self.n_iter,random_state=np.random.randint(10e5))
-
-            P[key] = U
-            D[key] = np.dot(U.T,C).T
-
-        return P, D
-
-    def _add_regularization(self,Y,mYs,lam,SVD=None,pre_reg=False):
-        """ Prepares the data matrix and its marginalizations for the randomized_dpca solver (see paper)."""
-        n_features = Y.shape[0]
-
-        if not pre_reg:
-            regY = np.hstack([Y.reshape((n_features,-1)),lam*np.eye(n_features)])
-        else:
-            regY = Y
-            regY[:,-n_features:] = lam*eye(n_features)
-
-        if not pre_reg:
-            regmYs = OrderedDict()
-
-            for key in list(mYs.keys()):
-                regmYs[key] = np.hstack([mYs[key],np.zeros((n_features,n_features))])
-        else:
-            regmYs = mYs
-
-        if SVD is not None:
-            U,s,V = SVD
-
-            M = ((s**2 + lam**2)**-1)[:,None]*U.T
-            pregY = np.dot(np.vstack([V.T*s[None,:],lam*U]),M)
-        else:
-            pregY = np.dot(regY.reshape((n_features,-1)).T,np.linalg.inv(np.dot(Y.reshape((n_features,-1)),Y.reshape((n_features,-1)).T) + lam**2*np.eye(n_features)))
-
-        return regY, regmYs, pregY
-
-    def _fit(self, X, trialX=None, mXs=None, center=True, SVD=None, optimize=True):
-        """ Fit the model on X
-
-        Parameters
-        ----------
-            X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-                Training data, where n_samples in the number of samples
-                and n_features_j is the number of the j-features (where the axis correspond
-                to different parameters).
-
-            trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                with different trials. If different combinations of features have different number
-                of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                points with NaN.
-
-            mXs: dict with values in the shape of X
-                Marginalized data, should be the result of dpca._marginalize
-
-            center: bool
-                Centers data if center = True
-
-            SVD: list of arrays
-                Singular-value decomposition of the data. Don't provide!
-
-            optimize: bool
-                Flag to turn automatic optimization of regularization parameter on or off. Needed
-                internally.
-        """
-
-        def flat2d(A):
-            ''' Flattens all but the first axis of an ndarray, returns view. '''
-            return A.reshape((A.shape[0],-1))
-
-        # X = check_array(X)
-
-        n_features = X.shape[0]
-
-        # center data
-        if center:
-            X = X - np.mean(flat2d(X),1).reshape((n_features,) + len(self.labels)*(1,))
-
-        # marginalize data
-        if mXs is None:
-            mXs = self._marginalize(X)
-
-        # compute optimal regularization
-        if self.opt_regularizer_flag and optimize:
-            if self.debug > 0:
-                print("Start optimizing regularization.")
-
-            if trialX is None:
-                raise ValueError('To optimize the regularization parameter, the trial-by-trial data trialX needs to be provided.')
-
-            self._optimize_regularization(X,trialX)
-
-        # add regularization
-        if self.regularizer > 0:
-            regX, regmXs, pregX = self._add_regularization(X,mXs,self.regularizer*np.sum(X**2),SVD=SVD)
-        else:
-            regX, regmXs, pregX = X, mXs, pinv(X.reshape((n_features,-1)))
-
-        # compute closed-form solution
-        self.P, self.D = self._randomized_dpca(regX,regmXs,pinvX=pregX)
-
-    def _zero_mean(self,X):
-        """ Subtracts the mean from each observable """
-        return X - np.mean(X.reshape((X.shape[0],-1)),1).reshape((X.shape[0],) + (len(X.shape)-1)*(1,))
-
-    def _roll_back(self,X,axes,invert=False):
-        ''' Rolls all axis in list crossval_protect to the end (or inverts if invert=True) '''
-        rX = X
-        axes = np.sort(axes)
-
-        if invert:
-            for ax in reversed(axes):
-                rX = np.rollaxis(rX,-1,start=ax)
-        else:
-            for ax in axes:
-                rX = np.rollaxis(rX,ax,start=len(X.shape))
-
-        return rX
-
-    def _get_n_samples(self,trialX,protect=None):
-        """ Computes the number of samples for each parameter combinations (except along protect) """
-        n_unprotect = len(trialX.shape) - len(protect) - 1 if protect is not None else len(trialX.shape) - 1
-        n_protect   = len(protect) if protect is not None else 0
-
-        return trialX.shape[0] - np.sum(np.isnan(trialX[(np.s_[:],) + (np.s_[:],)*n_unprotect + (0,)*n_protect]),0)
-
-    def _check_protected(self,X,protect):
-        ''' Checks if protect == None or, alternatively, if all protected axis are at the end '''
-        if protect is None:
-            protected = True
-        else:
-            # convert label in index
-            protect = [self.labels.index(ax) for ax in protect]
-            if set(protect) == set(np.arange(len(self.labels)-len(protect),len(self.labels))):
-                protected = True
-            else:
-                protected = False
-                print('Not all protected axis are at the end! While the algorithm will still work, the performance of the shuffling algorithm will substantially decrease due to unavoidable copies.')
-
-        return protected
-
-    def train_test_split(self,X,trialX,N_samples=None,sample_ax=0):
-        """ Splits data in training and validation trial. To this end, we select one data-point in each observable for every
-            combination of parameters (except along protected axis) for the validation set and average the remaining trial-by-trial
-            data to get the training set.
-
-            Parameters
-            ----------
-                X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-                    Training data, where n_samples in the number of samples
-                    and n_features_j is the number of the j-features (where the axis correspond
-                    to different parameters).
-
-                trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                    Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                    with different trials. If different combinations of features have different number
-                    of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                    points with NaN.
-
-                N_samples: array-like with the same shape as X (except for protected axis).
-                    Number of trials in each condition. If None, computed from trial data.
-
-
-            Returns
-            -------
-                trainX: array-like, same shape as X
-                    Training data
-
-                blindX: array-like, same shape as X
-                    Validation data
-
-        """
-        def flat2d(A):
-            ''' Flattens all but the first axis of an ndarray, returns view. '''
-            return A.reshape((A.shape[0],-1))
-
-        protect = self.protect
-
-        n_samples   = trialX.shape[-1]                       # number of samples
-        n_unprotect = len(X.shape) - len(protect) if protect is not None else len(X.shape)
-        n_protect   = len(protect) if protect is not None else 0
-
-        if sample_ax != 0:
-            raise NotImplemented('The sample axis needs to come first.')
-
-        # test if all protected axes lie at the end
-        protected = self._check_protected(trialX,protect)
-
-        # reorder matrix to protect certain axis (for speedup)
-        if not(protected):
-            # turn crossval_protect into index listX
-            axes = [self.labels.index(ax) + 2 for ax in protect]
-
-            # reorder matrix
-            trialX = self._roll_back(trialX,axes)
-            X = np.squeeze(self._roll_back(X[None,...],axes))
-
-        # compute number of samples in each condition
-        if N_samples is None:
-            N_samples = self._get_n_samples(trialX,protect=self.protect)
-
-        # get random indices
-        idx = (np.random.rand(*N_samples.shape)*N_samples).astype(int)
-
-        # select values
-        blindX = np.empty(trialX.shape[1:])
-
-        # iterate over multi_index
-        it = np.nditer(np.empty(N_samples.shape), flags=['multi_index'])
-
-        while not it.finished:
-            blindX[it.multi_index + (np.s_[:],)*n_protect] = trialX[(idx[it.multi_index],) + it.multi_index + (np.s_[:],)*n_protect]
-            it.iternext()
-
-        # compute trainX
-        trainX = (X*(N_samples/(N_samples-1))[(np.s_[:],)*n_unprotect + (None,)*n_protect] - blindX/(N_samples-1)[(np.s_[:],)*n_unprotect + (None,)*n_protect])
-
-        # inverse rolled axis in blindX
-        if not(protected):
-            blindX = self._roll_back(blindX[...,None],axes,invert=True)[...,0]
-            trainX = self._roll_back(trainX[...,None],axes,invert=True)[...,0]
-
-        # remean datasets (both equally)
-        trainX -= np.mean(flat2d(trainX),1)[(np.s_[:],) + (None,)*(len(X.shape)-1)]
-        blindX -= np.mean(flat2d(blindX),1)[(np.s_[:],) + (None,)*(len(X.shape)-1)]
-
-        return trainX, blindX
-
-    def shuffle_labels(self,trialX):
-        """ Shuffles *inplace* labels between conditions in trial-by-trial data, respecting the number of trials per condition.
-
-            Parameters
-            ----------
-                trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                    Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                    with different trials. If different combinations of features have different number
-                    of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                    points with NaN.
-
-        """
-
-        # import shuffling algorithm from cython source
-        protect = self.protect
-
-        # test if all protected axes lie at the end
-        protected = self._check_protected(trialX,protect)
-
-        # reorder matrix to protect certain axis (for speedup)
-        if not(protected):
-            # turn crossval_protect into index list
-            axes = [self.labels.index(ax) + 2 for ax in protect]
-
-            # reorder matrix
-            trialX = self._roll_back(trialX,axes)
-
-        # reshape all non-protect axis into one vector
-        original_shape = trialX.shape
-        trialX = trialX.reshape((-1,) + trialX.shape[-len(protect):])
-
-        # reshape all protected axis into one
-        original_shape_protected = trialX.shape
-        trialX = trialX.reshape((trialX.shape[0],-1))
-
-        # shuffle within non-protected axis
-        shuffle2D(trialX)
-
-        # inverse reshaping of protected axis
-        trialX = trialX.reshape(original_shape_protected)
-
-        # inverse reshaping & sample axis
-        trialX = trialX.reshape(original_shape)
-        #trialX = np.rollaxis(trialX,0,len(original_shape))
-
-        # inverse rolled axis in trialX
-        if protected:
-            trialX = self._roll_back(trialX,axes,invert=True)
-
-        return trialX
-
-    def significance_analysis(self,X,trialX,n_shuffles=100,n_splits=100,n_consecutive=1,axis=None,full=False):
-        '''
-            Cross-validated significance analysis of dPCA model. Here the generalization from the training
-            to test data is tested by a simple classification measure in which one tries to predict the
-            label of a validation test point from the training data. The performance is tested for n_splits
-            test and training separations. The classification performance is then compared against
-            the performance on data with randomly shuffled labels. Only if the performance is higher
-            then the maximum in the shuffled data we regard the component as significant.
-
-            Parameters
-            ----------
-                X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-                    Training data, where n_samples in the number of samples
-                    and n_features_j is the number of the j-features (where the axis correspond
-                    to different parameters).
-
-                trialX: array-like, shape (n_trials, n_samples, n_features_1, n_features_2, ...)
-                    Trial-by-trial data. Shape is similar to X but with an additional axis at the beginning
-                    with different trials. If different combinations of features have different number
-                    of trials, then set n_samples to the maximum number of trials and fill unoccupied data
-                    points with NaN.
-
-                n_shuffles: integer
-                    Number of label shuffles over which the maximum is taken (default = 100, which
-                    is equivalent to p > 0.01)
-
-                n_splits: integer
-                    Number of train-test splits per shuffle, from which the average performance is
-                    deduced.
-
-                n_consecutive: integer
-                    Sometimes individual data points are deemed significant purely by chance. To reduced
-                    such noise one can demand that at least n consecutive data points are rated as significant.
-
-                axis: None or True (default = None)
-                    Determines whether the significance is calculated over the last axis. More precisely,
-                    one is often interested in determining the significance of a component over time. In this
-                    case, set axis to True and make sure the last axis is time.
-
-                full: Boolean (default = False)
-                    Whether or not all scores are returned. If False, only the significance matrix is returned.
-
-
-            Returns
-            -------
-                masks: Dictionary
-                    Dictionary with keys corresponding to the marginalizations and with values that are
-                    binary nparrays that capture the significance of the demixed components.
-
-                true_score: Dictionary  (only returned when full = True)
-                    Dictionary with the scores of the data.
-
-                scores: Dictionary  (only returned when full = True)
-                    Dictionary with the scores of the shuffled data.
-
-        '''
-        assert axis in [None, True]
-        
-        def compute_mean_score(X,trialX,n_splits):
-            K = 1 if axis is None else X.shape[-1]
-
-            if type(self.n_components) == int:
-                scores = {key : np.empty((self.n_components, n_splits, K)) for key in keys}
-            else:
-                scores = {key : np.empty((self.n_components[key], n_splits, K)) for key in keys}
-
-            for shuffle in range(n_splits):
-                print('.', end=' ')
-
-                # do train-validation split
-                trainX, validX = self.train_test_split(X,trialX)
-
-                # fit a dPCA model to training data & transform validation data
-                trainZ = self.fit_transform(trainX)
-                validZ = self.transform(validX)
-
-                # reshape data to match Cython input
-                for key in keys:
-                    ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
-
-                    # mean over all axis not in key
-                    axset = self.marginalizations[key]
-                    axset = axset if type(axset) == set else set.union(*axset)
-                    axes = set(range(len(X.shape)-1)) - axset
-                    for ax in list(axes)[::-1]:
-                        trainZ[key] = np.mean(trainZ[key],axis=ax+1)
-                        validZ[key] = np.mean(validZ[key],axis=ax+1)
-
-                    # reshape
-                    if len(X.shape)-2 in axset and axis is not None:
-                        trainZ[key] = trainZ[key].reshape((ncomps,-1,K))
-                        validZ[key] = validZ[key].reshape((ncomps,-1,K))
-                    else:
-                        trainZ[key] = trainZ[key].reshape((ncomps,-1,1))
-                        validZ[key] = validZ[key].reshape((ncomps,-1,1))
-
-                # compute classification score
-                for key in keys:
-                    ncomps = self.n_components if type(self.n_components) == int else self.n_components[key]
-                    for comp in range(ncomps):
-                        scores[key][comp, shuffle] = classification(trainZ[key][comp],validZ[key][comp])
-
-            for key in keys:
-                scores[key] = np.nanmean(scores[key], axis=1)
-                        
-            return scores
-
+    def _fit(self, X, trialX=None, Cnoise=None):
+        X = np.asarray(X, dtype=float)
+        if X.ndim != len(self.labels) + 1:
+            raise ValueError("X must have one axis per label plus the leading neuron axis")
         if self.opt_regularizer_flag:
-            print("Regularization not optimized yet; start optimization now.")
-            self._optimize_regularization(X,trialX)
+            if trialX is None:
+                raise ValueError('To optimize the regularization parameter, the trial-by-trial data trialX needs '
+                                 'to be provided.')
+            self._optimize_regularization(X, trialX)
 
-        keys = list(self.marginalizations.keys())
-        keys.remove(self.labels[-1])
+        nc = self._num_comps()
+        W, V, which = core.dpca(X, nc, combined_params=self._combined_params(), lambda_=self.regularizer,
+                                order=True, Cnoise=Cnoise)
+        keys = list(self.marginalizations)
+        self.P = {k: V[:, which == i + 1] for i, k in enumerate(keys)}
+        self.D = {k: W[:, which == i + 1] for i, k in enumerate(keys)}
 
-        # shuffling is in-place, so we need to copy the data
-        trialX = trialX.copy()
+        # explained variance on the training data, components grouped per marginalization
+        Wc = np.hstack([self.D[k] for k in keys])
+        Vc = np.hstack([self.P[k] for k in keys])
+        self.component_order_ = [(k, j) for k in keys for j in range(self.D[k].shape[1])]
+        try:
+            self.explained_var_ = core.dpca_explained_variance(X, Wc, Vc, combined_params=self._combined_params())
+        except ValueError:                  # more components than PCA components (MATLAB errors as well)
+            self.explained_var_ = None
+        # MATLAB explVar.margVar of each component in its own marginalization
+        Xc = self._zero_mean(X).reshape(X.shape[0], -1)
+        total = np.sum(Xc ** 2)
+        margs = self._marginalize(X)
+        self.explained_variance_ratio_ = {}
+        for k in keys:
+            Xm, P, D = margs[k], self.P[k], self.D[k]
+            self.explained_variance_ratio_[k] = [
+                (np.sum(Xm ** 2) - np.sum((Xm - np.outer(P[:, j], D[:, j] @ Xm)) ** 2)) / total
+                for j in range(D.shape[1])]
 
-        # compute score of original data
-        print("Compute score of data: ", end=' ')
-        true_score = compute_mean_score(X,trialX,n_splits)
-        print("Finished.")
+    def _optimize_regularization(self, X, trialX):
+        Xtrial, num_trials = self._matlab_trials(X, trialX)
+        lam, lams, errors, errors_marg = core.dpca_optimize_lambda(
+            X, Xtrial, num_trials, num_comps=self._num_comps(), lambdas=self.lambdas, num_rep=self.n_trials,
+            combined_params=self._combined_params(), method=self.cv_method, simultaneous=self.simultaneous,
+            noise_cov_type=self.noise_cov_type, rng=self._rng(), verbose=self.debug > 1)
+        lambdas = 1e-7 * 1.5 ** np.arange(26) if self.lambdas is None else np.asarray(self.lambdas)
+        if self.debug > 0 and lam in (lambdas[0], lambdas[-1]):
+            print("Warning: Optimal regularization parameter lies at the boundary of the search interval. "
+                  "Please provide a different search list (lambdas).")
+        self.regularizer = lam
+        self.cv_errors_ = errors
+        self.cv_errors_marg_ = errors_marg
+        self.opt_regularizer_flag = False
+        if self.debug > 1:
+            print('Optimized regularization, optimal lambda = ', lam)
 
-        # data collection
-        scores = {key : [] for key in keys}
+    def get_noise_covariance(self, X, trialX, type="pooled"):
+        """Noise covariance matrix (MATLAB dpca_getNoiseCovariance) for ``fit(..., Cnoise=...)``."""
+        Xtrial, num_trials = self._matlab_trials(np.asarray(X, float), trialX)
+        return core.dpca_get_noise_covariance(np.asarray(X, float), Xtrial, num_trials,
+                                              simultaneous=self.simultaneous, type=type)
 
-        # iterate over shuffles
-        for it in range(n_shuffles):
-            print("\rCompute score of shuffled data: ", str(it), "/", str(n_shuffles), end=' ')
+    # ------------------------------------------------------------------ projections
+    def _zero_mean(self, X):
+        """ Subtracts the mean from each observable """
+        return X - np.mean(X.reshape((X.shape[0], -1)), 1).reshape((X.shape[0],) + (len(X.shape) - 1) * (1,))
 
-            # shuffle labels
-            self.shuffle_labels(trialX)
-
-            # mean trial-by-trial data
-            X = np.nanmean(trialX,axis=0)
-
-            score = compute_mean_score(X,trialX,n_splits)
-
-            for key in keys:
-                scores[key].append(score[key])
-
-        # binary mask, if data score is above maximum shuffled score make true
-        masks = {}
-        for key in keys:
-            maxscore = np.amax(np.dstack(scores[key]),-1)
-            masks[key] = true_score[key] > maxscore
-
-        if n_consecutive > 1:
-            for key in keys:
-                mask = masks[key]
-
-                for k in range(mask.shape[0]):
-                    masks[key][k,:] = denoise_mask(masks[key][k].astype(np.int32),n_consecutive)
-
-        if full:
-            return masks, true_score, scores
-        else:
-            return masks
+    def _marginalize(self, X):
+        """Marginalized data as a dict of arrays flattened to (n_features, -1)."""
+        margs, _ = core.dpca_marginalize(np.asarray(X, float), combined_params=self._combined_params())
+        return OrderedDict((k, m.reshape(m.shape[0], -1)) for k, m in zip(self.marginalizations, margs))
 
     def transform(self, X, marginalization=None):
-        """Apply the dimensionality reduction on X.
+        """Project the (centered) data onto the decoders.
 
-        X is projected on the first principal components previous extracted
-        from a training set.
-
-        Parameters
-        ----------
-        X: array-like, shape (n_samples, n_features_1, n_features_2, ...)
-            Training data, where n_samples in the number of samples
-            and n_features_j is the number of the j-features (where the axis correspond
-            to different parameters).
-
-        marginalization : str or None
-            Marginalization subspace upon which to project, if None return dict
-            with projections on all marginalizations
-
-        Returns
-        -------
-        X_new : dict with arrays of the same shape as X
-            Dictionary in which each key refers to one marginalization and the value is the
-            latent component. If specific marginalization is given, returns only array
-
+        Returns a dict {marginalization: array (n_components, n_1, n_2, ...)} or, if
+        ``marginalization`` is given, only that array.
         """
-        X = self._zero_mean(X)
-        total_variance = np.sum(X**2)
-        Xmargs = self._marginalize(X)
+        X = self._zero_mean(np.asarray(X, float))
+        Xr = X.reshape((X.shape[0], -1))
 
-        def marginal_variances(marginal):
-            ''' Computes the relative variance explained of each component
-                within a marginalization
-            '''
-            D, P, Xmarg = self.D[marginal], self.P[marginal], Xmargs[marginal]
-            return [(np.sum(Xmarg**2)-np.sum((Xmarg-np.outer(P[:, k], np.dot(D[:,k], Xmarg)))**2)) / total_variance for k in range(D.shape[1])]
+        def proj(key):
+            D = self.D[key]
+            return np.dot(D.T, Xr).reshape((D.shape[1],) + X.shape[1:])
 
         if marginalization is not None:
-            D, Xr         = self.D[marginalization], X.reshape((X.shape[0],-1))
-            X_transformed = np.dot(D.T, Xr).reshape((D.shape[1],) + X.shape[1:])
-            self.explained_variance_ratio_ = {marginalization : marginal_variances(marginalization)}
-        else:
-            X_transformed = {}
-            self.explained_variance_ratio_ = {}
-            for key in list(self.marginalizations.keys()):
-                X_transformed[key] = np.dot(self.D[key].T, X.reshape((X.shape[0],-1))).reshape((self.D[key].shape[1],) + X.shape[1:])
-                self.explained_variance_ratio_[key] = marginal_variances(key)
-
-        return X_transformed
+            return proj(marginalization)
+        return {key: proj(key) for key in self.marginalizations}
 
     def inverse_transform(self, X, marginalization):
-        """ Transform data back to its original space, i.e.,
-        return an input X_original whose transform would be X
-
-        Parameters
-        ----------
-        X : array-like, shape (n_samples, n_components)
-            New data, where n_samples is the number of samples
-            and n_components is the number of components.
-
-        Returns
-        -------
-        X_original array-like, shape (n_samples, n_features)
-        """
-        X = self._zero_mean(X)
-        X_transformed = np.dot(self.P[marginalization],X.reshape((X.shape[0],-1))).reshape((self.P[marginalization].shape[0],) + X.shape[1:])
-
-        return X_transformed
+        """Map latent components (n_components, n_1, ...) back to data space: P @ X."""
+        X = np.asarray(X, float)
+        P = self.P[marginalization]
+        return np.dot(P, X.reshape((X.shape[0], -1))).reshape((P.shape[0],) + X.shape[1:])
 
     def reconstruct(self, X, marginalization):
-        """ Transform data first into reduced space before projecting
-        it back into data space. Equivalent to inverse_transform(transform(X)).
+        """Equivalent to inverse_transform(transform(X, marginalization), marginalization)."""
+        return self.inverse_transform(self.transform(X, marginalization), marginalization)
+
+    # ------------------------------------------------------------------ cross-validation helpers
+    def train_test_split(self, X, trialX):
+        """One random test trial per neuron and condition (same trial at all time points), as in
+        MATLAB. Returns (trainX, testX): the mean of the remaining trials and the test trial."""
+        X = np.asarray(X, float)
+        Xtrial, num_trials = self._matlab_trials(X, trialX)
+        Xtest, _ = core.dpca_get_test_trials(Xtrial, num_trials, rng=self._rng(), simultaneous=self.simultaneous)
+        ntc = num_trials.reshape(num_trials.shape + (1,))
+        return (X * ntc - Xtest) / (ntc - 1), Xtest
+
+    def shuffle_labels(self, trialX):
+        """Return a copy of trialX with whole trials shuffled across conditions within each
+        neuron (preserving trial counts per condition); missing trials stay NaN."""
+        trialX = np.asarray(trialX, float)
+        Xtrial, num_trials = self._matlab_trials(np.nanmean(trialX, 0), trialX)
+        sh = core.dpca_shuffle_trials(Xtrial, num_trials, rng=self._rng(), simultaneous=self.simultaneous)
+        sh[np.isnan(Xtrial)] = np.nan
+        return np.moveaxis(sh, -1, 0)
+
+    # ------------------------------------------------------------------ significance
+    def significance_analysis(self, X, trialX, n_shuffles=100, n_splits=100, n_consecutive=1, axis=None,
+                              full=False, n_components=3, decoding_classes=None):
+        '''Cross-validated significance of the demixed components over time (MATLAB
+        ``dpca_classificationAccuracy`` + ``dpca_classificationShuffled`` + ``dpca_signifComponents``).
+
+        For every non-time marginalization, dPCA is refitted on ``n_splits`` random train/test
+        splits and each test trial is classified by the nearest training class mean at each time
+        point. A time point of a component is significant if its accuracy exceeds the maximum
+        accuracy over ``n_shuffles`` label shuffles. The fitted model (P, D) is not modified.
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_components)
-            New data, where n_samples is the number of samples
-            and n_components is the number of components.
+        X : array (n_features, n_1, ..., n_T)
+        trialX : array (n_trials, n_features, n_1, ..., n_T), NaN-padded at the end
+        n_shuffles : int
+            Number of label shuffles (MATLAB 'numShuffles').
+        n_splits : int
+            Number of train/test splits (MATLAB 'numRep').
+        n_consecutive : int
+            MATLAB 'minChunk': runs of L significant bins with L + 1 < n_consecutive are removed.
+            The default 1 disables this filter (MATLAB's default is minChunk = 10).
+        axis : ignored (significance is always computed per time point, as in MATLAB).
+        full : bool
+            Also return the accuracies.
+        n_components : int
+            Number of components tested per marginalization (MATLAB 'numComps', default 3;
+            at most 3 are used for the masks, as in MATLAB).
+        decoding_classes : dict or None
+            {marginalization: array of 1-based class ids shaped like the condition axes};
+            default is one class per condition.
 
         Returns
         -------
-        X_original array-like, shape (n_samples, n_features)
-        """
-        return self.inverse_transform(self.transform(X,marginalization),marginalization)
+        masks : dict {marginalization: bool array (n_components of the fitted model, T)}
+        accuracy, accuracy_shuffle : dicts (only if full=True), arrays (n_components, T) and
+            (T, n_shuffles).
+        '''
+        if axis is not None:
+            warnings.warn("axis is ignored; significance is computed for every time point.", stacklevel=2)
+        X = np.asarray(X, float)
+        if self.opt_regularizer_flag:
+            self._optimize_regularization(X, trialX)
+        Xtrial, num_trials = self._matlab_trials(X, trialX)
+        keys = list(self.marginalizations)
+        groups = self._combined_params()
+        classes = None
+        if decoding_classes is not None:
+            classes = [decoding_classes.get(k) for k in keys]
+
+        rng = self._rng()
+        common = dict(lambda_=self.regularizer, num_rep=n_splits, combined_params=groups, decoding_classes=classes,
+                      simultaneous=self.simultaneous, noise_cov_type=self.noise_cov_type, rng=rng,
+                      verbose=self.debug > 1)
+        acc, _ = core.dpca_classification_accuracy(X, Xtrial, num_trials, num_comps=n_components, **common)
+        shuf, _ = core.dpca_classification_shuffled(Xtrial, num_trials, num_shuffles=n_shuffles, **common)
+
+        which = np.concatenate([np.full(self.D[k].shape[1], i + 1) for i, k in enumerate(keys)])
+        sig = core.dpca_signif_components(acc, shuf, which, min_chunk=n_consecutive).astype(bool)
+
+        masks, accuracy, accuracy_shuffle = {}, {}, {}
+        for i, k in enumerate(keys):
+            if np.isnan(acc[i, 0, 0]):
+                continue                     # time marginalization
+            masks[k] = sig[which == i + 1]
+            accuracy[k] = acc[i]
+            accuracy_shuffle[k] = shuf[i]
+        if full:
+            return masks, accuracy, accuracy_shuffle
+        return masks
